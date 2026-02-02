@@ -1,0 +1,234 @@
+Design Note: Snapshot Garbage Collector (Snapshot GC)
+1. Overview
+Snapshot-based systems (build caches, databases, backups, artifact stores) generate a large number of snapshots over time. While snapshots are essential for recovery, debugging, and incremental processing, unbounded snapshot growth leads to excessive storage usage, degraded performance, and operational risk.
+This document describes the design of Snapshot GC, a safe, fault‑tolerant garbage collector for snapshot management that reclaims obsolete snapshots while guaranteeing correctness, recoverability, and operational stability.
+The design follows a two‑phase Tombstone → Delete model, supports retention policies, dependency tracking, leasing, retries, leader election, and is safe to run in distributed environments.
+
+2. Problem Statement
+Key challenges in snapshot lifecycle management:
+
+Snapshots accumulate rapidly and grow storage cost.
+Some snapshots are logically deleted but still required temporarily for recovery or replication.
+Snapshots may have dependencies (incremental chains / parents).
+Concurrent readers may still access snapshots.
+Deletion may fail due to IO errors, corruption, or transient infra failures.
+Multiple instances may attempt cleanup simultaneously in distributed systems.
+
+A naïve “delete-old-files” approach risks:
+
+Data loss
+Breaking incremental chains
+Deleting in-use snapshots
+Repeated deletion thrashing on corrupted data
+
+
+3. Design Goals
+Functional Goals
+
+Enforce retention policies (count-based, age-based).
+Preserve snapshots with:
+
+Active readers (leases)
+Explicit pins / legal hold tags
+Dependency relationships
+
+
+Safely reclaim storage for obsolete snapshots.
+
+Non‑Functional Goals
+
+Crash safe: resilient to process restarts mid‑GC.
+Idempotent: repeated runs cause no harm.
+Observable: emit events, metrics, audit logs.
+Scalable: supports millions of snapshots.
+Distributed-safe: only one active GC per cluster.
+Recoverable: allow rollback window after logical deletion.
+
+
+4. High-Level Architecture
++------------------+
+|   GC Scheduler   |  (cron / background job)
++------------------+
+         |
+         v
++------------------+        +------------------+
+|   Snapshot GC    | -----> | Snapshot Catalog |
+|  (Mark / Sweep)  |        | (metadata store) |
++------------------+        +------------------+
+         |
+         v
++------------------+
+| Storage Backend  |
+| (FS / Blob / S3) |
++------------------+
+
+
+5. Snapshot Metadata Model
+Each snapshot is represented by immutable payload + mutable metadata.
+Snapshot Metadata
+SnapshotId
+CreatedTime
+State: Active | Tombstoned | Deleting | Deleted | Quarantined
+ParentSnapshotId (optional)
+LeaseCount
+Tags: [pin, retain, legal]
+LastAccessTime
+HardDeleteAfter (immutable once set)
+DeleteFailureCount
+NextRetryTime
+
+
+6. Snapshot State Machine
+               +---------+
+               | Active  |
+               +---------+
+                    |
+           (No refs, policy eligible)
+                    |
+                    v
+             +----------------+
+             |  Tombstoned    |  <-- soft delete (recoverable)
+             +----------------+
+                    |
+           (Grace period expired)
+                    |
+                    v
+              +-------------+
+              |  Deleting   |
+              +-------------+
+                |        |
+        success |        | failure
+                v        v
+           +---------+  +-------------+
+           | Deleted |  | Quarantined |
+           +---------+  +-------------+
+
+Key Properties
+
+Tombstoned != Deleted
+Snapshot is logically deleted but payload may still exist.
+HardDeleteAfter is fixed at tombstone time, so later policy changes do not retroactively affect deletion.
+Quarantined snapshots stop retry loops and require manual intervention.
+
+
+7. Garbage Collection Algorithm
+Phase 1: Mark (Liveness Detection)
+Compute Live Snapshot Set:
+A snapshot is considered live if any of the following is true:
+
+Among latest N snapshots
+Created after retention cutoff
+Has active leases (LeaseCount > 0)
+Tagged as pinned / legal hold
+Is a parent of another live snapshot (dependency closure)
+
+All remaining Active + Non‑Live snapshots become GC candidates.
+
+Phase 2: Tombstone (Soft Delete)
+For each eligible candidate:
+
+Transition Active → Tombstoned
+Set HardDeleteAfter = now + gracePeriod
+Emit TOMBSTONE audit event
+
+
+Tombstoned snapshots:
+
+Fail if accessed
+Are visible in metadata
+Are still recoverable during grace period
+
+
+
+Phase 3: Sweep (Hard Delete)
+For each Tombstoned snapshot:
+
+Only proceed if:
+
+Grace period expired
+No active leases
+Retry backoff allows
+
+
+Transition Tombstoned → Deleting
+Delete payload from storage (batchable)
+On success:
+
+Transition Deleting → Deleted
+
+
+On failure:
+
+Increment failure count
+Apply exponential backoff
+Move to Quarantined if threshold exceeded
+
+
+
+
+8. Safety & Correctness Guarantees
+Concurrency Safety
+
+Leases prevent deletion of active snapshots
+CAS‑style state transitions prevent races
+Dependency closure prevents orphaned children
+
+Crash Safety
+
+State persisted in catalog before deletion
+Deleting state allows restart-safe continuation
+Journal-based catalog replay restores progress
+
+Distributed Safety
+
+Leader election (lock/lease) ensures one GC instance
+Other instances exit immediately
+
+
+9. Failure Handling Strategy
+
+FailureType               Handling
+Transient                 IORetry with exponential backoff
+Corrupt                   dataQuarantine snapshot
+Process crash             Resume from persisted state
+Storage inconsistency     Verify existence before delete
+Policy changes            Do NOT retroactively change deletion time
+
+10. Observability & Auditing
+Emitted Events
+
+TOMBSTONE
+DELETE_OK
+DELETE_FAIL
+QUARANTINE
+INACTIVE_ELIGIBLE
+
+Metrics
+
+Snapshots scanned
+Tombstoned count
+Deleted count
+Failed deletions
+Quarantined count
+Bytes reclaimed
+
+
+11. Extension Points
+
+Storage backend: FS / Azure Blob / S3
+Metadata catalog: SQLite / Cosmos / File journal
+Corruption watchdog integration
+Batch delete optimization
+Throttling controls
+Policy injection at runtime
+
+
+12. Summary
+Snapshot GC provides:
+
+✅ Safe snapshot lifecycle automation
+✅ Strong correctness and recoverability guarantees
+✅ Production-grade fault tolerance
+✅ Simple, extensible architecture
+
+The design intentionally separates logical deletion (tombstone) from physical deletion, making it suitable for enterprise storage, build systems, and data platforms.
